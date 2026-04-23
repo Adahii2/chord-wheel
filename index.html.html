@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Hand-Tracked Chord Wheel</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #111;
+    color: #eee;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px;
+  }
+  h1 { font-weight: 500; font-size: 20px; margin: 0 0 12px; }
+  #status { font-size: 14px; color: #aaa; margin-bottom: 12px; text-align: center; }
+  .stage {
+    position: relative;
+    width: 100%;
+    max-width: 960px;
+    background: #000;
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  video { display: block; width: 100%; transform: scaleX(-1); }
+  canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; transform: scaleX(-1); }
+  .controls {
+    display: flex;
+    gap: 10px;
+    margin-top: 12px;
+    justify-content: center;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  button {
+    background: #222;
+    color: #eee;
+    border: 1px solid #444;
+    padding: 8px 16px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  button:hover:not(:disabled) { background: #333; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  select {
+    background: #222;
+    color: #eee;
+    border: 1px solid #444;
+    padding: 6px 8px;
+    border-radius: 8px;
+    font-size: 14px;
+  }
+  label { font-size: 14px; display: flex; align-items: center; gap: 6px; }
+  #chordDisplay {
+    margin-top: 16px;
+    text-align: center;
+    font-size: 32px;
+    font-weight: 500;
+    min-height: 42px;
+  }
+  .hint { font-size: 13px; color: #888; text-align: center; margin-top: 8px; max-width: 600px; }
+  .hint strong { color: #ccc; font-weight: 500; }
+</style>
+</head>
+<body>
+  <h1>Hand-tracked chord wheel</h1>
+  <div id="status">Click start to enable your webcam</div>
+
+  <div class="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div class="controls">
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" disabled>Stop</button>
+    <label>
+      Instrument
+      <select id="instrument">
+        <option value="synth">Synth</option>
+        <option value="piano">Electric piano</option>
+        <option value="strings">Strings</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="showLandmarks" checked /> Show landmarks</label>
+  </div>
+
+  <div id="chordDisplay">—</div>
+  <div class="hint">
+    Left index finger → <strong>root</strong> (outer/left wheel). Right index finger → <strong>quality</strong> (right wheel). Hold both inside the wheels to sustain the chord.
+  </div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const video = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const ctx = overlay.getContext('2d');
+const statusEl = document.getElementById('status');
+const chordDisplay = document.getElementById('chordDisplay');
+const startBtn = document.getElementById('startBtn');
+const stopBtn = document.getElementById('stopBtn');
+const showLandmarksBox = document.getElementById('showLandmarks');
+const instrumentSel = document.getElementById('instrument');
+
+const ROOTS = ['C', 'G', 'D', 'A', 'E', 'B', 'F#', 'C#', 'G#', 'D#', 'A#', 'F'];
+const ROOT_MIDI = { 'C':60, 'C#':61, 'D':62, 'D#':63, 'E':64, 'F':65, 'F#':66, 'G':67, 'G#':68, 'A':69, 'A#':70, 'B':71 };
+
+const QUALITIES = [
+  { name: 'maj',    intervals: [0, 4, 7] },
+  { name: 'min',    intervals: [0, 3, 7] },
+  { name: '7',      intervals: [0, 4, 7, 10] },
+  { name: 'maj7',   intervals: [0, 4, 7, 11] },
+  { name: 'min7',   intervals: [0, 3, 7, 10] },
+  { name: 'dim',    intervals: [0, 3, 6] },
+  { name: 'aug',    intervals: [0, 4, 8] },
+  { name: 'sus2',   intervals: [0, 2, 7] },
+  { name: 'sus4',   intervals: [0, 5, 7] },
+  { name: 'add9',   intervals: [0, 4, 7, 14] },
+  { name: 'm9',     intervals: [0, 3, 7, 10, 14] },
+  { name: '6',      intervals: [0, 4, 7, 9] },
+];
+
+const COLORS = {
+  root:    'rgba(127, 119, 221, 0.7)',
+  rootSel: 'rgba(127, 119, 221, 1)',
+  qual:    'rgba(29, 158, 117, 0.7)',
+  qualSel: 'rgba(29, 158, 117, 1)',
+  text:    '#ffffff',
+  line:    'rgba(255,255,255,0.35)'
+};
+
+let audioCtx = null;
+let masterGain = null;
+let activeVoices = [];
+let currentChordKey = null;
+let landmarker = null;
+let rafId = null;
+let running = false;
+let lastVideoTime = -1;
+
+function log(msg) { statusEl.textContent = msg; }
+
+async function initAudio() {
+  if (audioCtx) return;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  masterGain = audioCtx.createGain();
+  masterGain.gain.value = 0.25;
+  masterGain.connect(audioCtx.destination);
+}
+
+function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
+
+// Each voice builder returns { oscs: [...], gain: GainNode }.
+// `gain` is the voice's output gain — stopChord fades it. `oscs` is the list of
+// oscillators/sources to stop after the fade completes.
+
+function buildSynthVoice(freq, now) {
+  // Two oscillators (triangle + sine octave below) into a gain, with a soft attack.
+  const o1 = audioCtx.createOscillator();
+  o1.type = 'triangle';
+  o1.frequency.value = freq;
+  const o2 = audioCtx.createOscillator();
+  o2.type = 'sine';
+  o2.frequency.value = freq * 0.5;
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(0, now);
+  g.gain.linearRampToValueAtTime(1, now + 0.04);
+  o1.connect(g);
+  o2.connect(g);
+  o1.start(now);
+  o2.start(now);
+  return { oscs: [o1, o2], gain: g, voiceGain: 0.22 };
+}
+
+function buildPianoVoice(freq, now) {
+  // 2-op FM: modulator -> carrier frequency. Percussive-ish envelope with a
+  // quick attack and medium decay gives an electric piano flavor.
+  const carrier = audioCtx.createOscillator();
+  carrier.type = 'sine';
+  carrier.frequency.value = freq;
+
+  const modulator = audioCtx.createOscillator();
+  modulator.type = 'sine';
+  modulator.frequency.value = freq * 3; // harmonic modulator
+
+  const modGain = audioCtx.createGain();
+  // Modulation depth envelope — lots at attack, quickly fading (that's what makes it "bell-like")
+  modGain.gain.setValueAtTime(freq * 2.5, now);
+  modGain.gain.exponentialRampToValueAtTime(freq * 0.2, now + 0.8);
+
+  modulator.connect(modGain);
+  modGain.connect(carrier.frequency);
+
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(0, now);
+  g.gain.linearRampToValueAtTime(1, now + 0.005);
+  g.gain.exponentialRampToValueAtTime(0.35, now + 1.2);
+
+  carrier.connect(g);
+  carrier.start(now);
+  modulator.start(now);
+  return { oscs: [carrier, modulator], gain: g, voiceGain: 0.3 };
+}
+
+function buildStringsVoice(freq, now) {
+  // Two detuned sawtooths -> lowpass -> gain. Slow attack for the string swell.
+  const o1 = audioCtx.createOscillator();
+  o1.type = 'sawtooth';
+  o1.frequency.value = freq;
+  o1.detune.value = -8;
+
+  const o2 = audioCtx.createOscillator();
+  o2.type = 'sawtooth';
+  o2.frequency.value = freq;
+  o2.detune.value = 8;
+
+  const filter = audioCtx.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.value = Math.min(freq * 6, 3500);
+  filter.Q.value = 0.7;
+
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(0, now);
+  g.gain.linearRampToValueAtTime(1, now + 0.35); // slow swell
+
+  o1.connect(filter);
+  o2.connect(filter);
+  filter.connect(g);
+  o1.start(now);
+  o2.start(now);
+  return { oscs: [o1, o2], gain: g, voiceGain: 0.18 };
+}
+
+const VOICE_BUILDERS = {
+  synth: buildSynthVoice,
+  piano: buildPianoVoice,
+  strings: buildStringsVoice,
+};
+
+function playChord(rootIdx, qualIdx) {
+  stopChord();
+  if (!audioCtx) return;
+  const baseMidi = ROOT_MIDI[ROOTS[rootIdx]];
+  const quality = QUALITIES[qualIdx];
+  const now = audioCtx.currentTime;
+  const builder = VOICE_BUILDERS[instrumentSel.value] || buildSynthVoice;
+
+  quality.intervals.forEach(iv => {
+    const freq = midiToFreq(baseMidi + iv);
+    const voice = builder(freq, now);
+    // Per-voice output gain balances the instrument's loudness and shares power
+    // across the chord tones.
+    const outGain = audioCtx.createGain();
+    outGain.gain.value = voice.voiceGain / quality.intervals.length;
+    voice.gain.connect(outGain);
+    outGain.connect(masterGain);
+    activeVoices.push({ oscs: voice.oscs, gain: voice.gain });
+  });
+}
+
+function stopChord() {
+  if (!audioCtx) return;
+  const now = audioCtx.currentTime;
+  activeVoices.forEach(v => {
+    try {
+      v.gain.gain.cancelScheduledValues(now);
+      v.gain.gain.setValueAtTime(v.gain.gain.value, now);
+      v.gain.gain.linearRampToValueAtTime(0.0001, now + 0.15);
+      v.oscs.forEach(o => {
+        try { o.stop(now + 0.2); } catch (e) {}
+      });
+    } catch (e) {}
+  });
+  activeVoices = [];
+}
+
+function drawWheel(cx, cy, rInner, rOuter, labels, selectedIdx, baseColor, selColor, textColor) {
+  const n = labels.length;
+  for (let i = 0; i < n; i++) {
+    const a0 = (i / n) * Math.PI * 2 - Math.PI / 2;
+    const a1 = ((i + 1) / n) * Math.PI * 2 - Math.PI / 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, rOuter, a0, a1);
+    ctx.arc(cx, cy, rInner, a1, a0, true);
+    ctx.closePath();
+    ctx.fillStyle = i === selectedIdx ? selColor : baseColor;
+    ctx.fill();
+    ctx.strokeStyle = COLORS.line;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    const am = (a0 + a1) / 2;
+    const rm = (rInner + rOuter) / 2;
+    const tx = cx + Math.cos(am) * rm;
+    const ty = cy + Math.sin(am) * rm;
+    ctx.save();
+    ctx.translate(tx, ty);
+    // Counter-mirror so text reads normally on the mirrored video.
+    ctx.scale(-1, 1);
+    ctx.fillStyle = textColor;
+    ctx.font = '600 16px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(labels[i], 0, 0);
+    ctx.restore();
+  }
+}
+
+function hitWheel(px, py, cx, cy, rInner, rOuter, n) {
+  const dx = px - cx, dy = py - cy;
+  const d = Math.hypot(dx, dy);
+  if (d < rInner || d > rOuter) return -1;
+  let a = Math.atan2(dy, dx) + Math.PI / 2;
+  if (a < 0) a += Math.PI * 2;
+  return Math.floor((a / (Math.PI * 2)) * n);
+}
+
+async function setup() {
+  try {
+    log('Loading hand tracker…');
+    const vision = await FilesetResolver.forVisionTasks(
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
+    );
+    landmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+        delegate: 'GPU'
+      },
+      runningMode: 'VIDEO',
+      numHands: 2
+    });
+
+    log('Requesting webcam…');
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+
+    overlay.width = video.videoWidth;
+    overlay.height = video.videoHeight;
+
+    await initAudio();
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+    log('Point left index finger at a root, right index finger at a quality. Hold both to sustain.');
+    running = true;
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    loop();
+  } catch (err) {
+    log('Error: ' + err.message);
+    console.error(err);
+  }
+}
+
+function teardown() {
+  running = false;
+  if (rafId) cancelAnimationFrame(rafId);
+  stopChord();
+  if (video.srcObject) {
+    video.srcObject.getTracks().forEach(t => t.stop());
+    video.srcObject = null;
+  }
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  log('Stopped');
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  chordDisplay.textContent = '—';
+}
+
+let leftHandLm = null, rightHandLm = null;
+
+function loop() {
+  if (!running) return;
+  const w = overlay.width, h = overlay.height;
+
+  const leftCx = w * 0.25;
+  const rightCx = w * 0.75;
+  const cy = h * 0.5;
+  const rOuter = Math.min(w * 0.22, h * 0.45);
+  const rInner = rOuter * 0.45;
+
+  ctx.clearRect(0, 0, w, h);
+
+  if (video.currentTime !== lastVideoTime && video.readyState >= 2) {
+    lastVideoTime = video.currentTime;
+    const result = landmarker.detectForVideo(video, performance.now());
+    if (result && result.landmarks && result.landmarks.length > 0) {
+      // Sort by index-finger tip x; after CSS mirror, smaller lm.x draws on the RIGHT of screen.
+      // The user's LEFT hand appears on the left side of their mirrored view, so its lm.x is LARGER.
+      const candidates = result.landmarks.map(lms => ({ lms, x: lms[8].x }));
+      candidates.sort((a, b) => a.x - b.x);
+      leftHandLm = candidates[0].lms;
+      rightHandLm = candidates.length >= 2 ? candidates[candidates.length - 1].lms : null;
+    } else {
+      leftHandLm = null;
+      rightHandLm = null;
+    }
+  }
+
+  // Canvas is CSS-mirrored, so draw using raw landmark coords — no x inversion.
+  function toCanvas(lm) {
+    return { x: lm.x * w, y: lm.y * h };
+  }
+
+  let rootIdx = -1, qualIdx = -1;
+  let leftTip = null, rightTip = null;
+
+  if (leftHandLm) {
+    leftTip = toCanvas(leftHandLm[8]);
+    rootIdx = hitWheel(leftTip.x, leftTip.y, leftCx, cy, rInner, rOuter, ROOTS.length);
+  }
+  if (rightHandLm) {
+    rightTip = toCanvas(rightHandLm[8]);
+    qualIdx = hitWheel(rightTip.x, rightTip.y, rightCx, cy, rInner, rOuter, QUALITIES.length);
+  }
+
+  drawWheel(leftCx, cy, rInner, rOuter, ROOTS, rootIdx, COLORS.root, COLORS.rootSel, COLORS.text);
+  drawWheel(rightCx, cy, rInner, rOuter, QUALITIES.map(q => q.name), qualIdx, COLORS.qual, COLORS.qualSel, COLORS.text);
+
+  // Center labels (counter-mirrored so they read normally)
+  ctx.save();
+  ctx.scale(-1, 1);
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.font = '600 12px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('ROOT', -leftCx, cy);
+  ctx.fillText('QUALITY', -rightCx, cy);
+  ctx.restore();
+
+  if (showLandmarksBox.checked) {
+    [leftHandLm, rightHandLm].forEach((hand, idx) => {
+      if (!hand) return;
+      ctx.fillStyle = idx === 0 ? '#7F77DD' : '#1D9E75';
+      for (const p of hand) {
+        const c = toCanvas(p);
+        ctx.beginPath();
+        ctx.arc(c.x, c.y, 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    });
+  }
+
+  if (leftTip) {
+    ctx.beginPath();
+    ctx.arc(leftTip.x, leftTip.y, 12, 0, Math.PI * 2);
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+  }
+  if (rightTip) {
+    ctx.beginPath();
+    ctx.arc(rightTip.x, rightTip.y, 12, 0, Math.PI * 2);
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+  }
+
+  // Trigger: both fingers on their wheels = sustain that chord
+  if (rootIdx >= 0 && qualIdx >= 0) {
+    const key = rootIdx + ':' + qualIdx;
+    if (key !== currentChordKey) {
+      currentChordKey = key;
+      playChord(rootIdx, qualIdx);
+      chordDisplay.textContent = ROOTS[rootIdx] + QUALITIES[qualIdx].name;
+    }
+  } else {
+    if (currentChordKey !== null) {
+      currentChordKey = null;
+      stopChord();
+      chordDisplay.textContent = '—';
+    }
+  }
+
+  rafId = requestAnimationFrame(loop);
+}
+
+startBtn.addEventListener('click', setup);
+stopBtn.addEventListener('click', teardown);
+instrumentSel.addEventListener('change', () => {
+  // If a chord is currently sustaining, re-play it on the new instrument.
+  if (currentChordKey) {
+    const [r, q] = currentChordKey.split(':').map(Number);
+    playChord(r, q);
+  }
+});
+</script>
+</body>
+</html>
